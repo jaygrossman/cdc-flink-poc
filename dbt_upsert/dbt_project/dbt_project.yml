@@ -1,0 +1,7 @@
+name: 'cdc_dbt_upsert'
+version: '1.0.0'
+config-version: 2
+profile: 'cdc_dbt_upsert'
+
+model-paths: ["models"]
+clean-targets: ["target", "dbt_packages"]

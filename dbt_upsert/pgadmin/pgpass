@@ -1,0 +1,1 @@
+postgres:5432:cdc_db:cdc_user:cdc_pass

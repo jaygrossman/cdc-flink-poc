@@ -1,0 +1,18 @@
+version: 2
+
+models:
+  - name: output_policy
+    description: "Merged policy data from CDC staging"
+    columns:
+      - name: policy_id
+        tests:
+          - unique
+          - not_null
+  - name: output_coverage
+    description: "Merged coverage data from CDC staging"
+  - name: output_vehicle
+    description: "Merged vehicle data from CDC staging"
+  - name: output_driver
+    description: "Merged driver data from CDC staging"
+  - name: output_claim
+    description: "Merged claim data from CDC staging"

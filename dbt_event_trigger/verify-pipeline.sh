@@ -1,9 +1,9 @@
 #!/bin/bash
 ###############################################################################
-# verify-pipeline.sh
-# Runs end-to-end diagnostics on the CDC pipeline.
+# verify-pipeline.sh (dbt_event_trigger variant)
+# Runs end-to-end diagnostics on the CDC pipeline with event-driven dbt.
 # Usage: chmod +x verify-pipeline.sh && ./verify-pipeline.sh
-# Run from the cdc-flink-poc/ directory (where docker-compose.yml lives).
+# Run from the dbt_event_trigger/ directory (where docker-compose.yml lives).
 ###############################################################################
 
 set -o pipefail
@@ -37,7 +37,7 @@ if [ $? -ne 0 ] || [ -z "$SERVICES_JSON" ]; then
     exit 1
 fi
 
-EXPECTED_RUNNING=("postgres" "zookeeper" "kafka" "kafka-connect" "flink-jobmanager" "flink-taskmanager" "pgadmin")
+EXPECTED_RUNNING=("postgres" "zookeeper" "kafka" "kafka-connect" "flink-jobmanager" "flink-taskmanager" "pgadmin" "dbt")
 
 for svc in "${EXPECTED_RUNNING[@]}"; do
     state=$(echo "$SERVICES_JSON" | python3 -c "
@@ -103,7 +103,6 @@ CONNECTOR_STATUS=$(curl -s http://localhost:8083/connectors/policy-connector/sta
 
 if [ -z "$CONNECTOR_STATUS" ]; then
     fail "Kafka Connect API not reachable at localhost:8083"
-    info "Run: docker compose logs kafka-connect"
 else
     CONN_STATE=$(echo "$CONNECTOR_STATUS" | python3 -c "import sys,json; print(json.load(sys.stdin)['connector']['state'])" 2>/dev/null)
     TASK_STATE=$(echo "$CONNECTOR_STATUS" | python3 -c "import sys,json; tasks=json.load(sys.stdin)['tasks']; print(tasks[0]['state'] if tasks else 'NO_TASKS')" 2>/dev/null)
@@ -112,17 +111,12 @@ else
         pass "Connector state: RUNNING"
     else
         fail "Connector state: ${CONN_STATE:-UNKNOWN}"
-        info "Run: curl -s http://localhost:8083/connectors/policy-connector/status | python3 -m json.tool"
     fi
 
     if [ "$TASK_STATE" = "RUNNING" ]; then
         pass "Task state: RUNNING"
     else
         fail "Task state: ${TASK_STATE:-UNKNOWN}"
-        TASK_TRACE=$(echo "$CONNECTOR_STATUS" | python3 -c "import sys,json; tasks=json.load(sys.stdin)['tasks']; print(tasks[0].get('trace','')[:200] if tasks else '')" 2>/dev/null)
-        if [ -n "$TASK_TRACE" ]; then
-            info "Error trace: $TASK_TRACE"
-        fi
     fi
 fi
 
@@ -134,9 +128,6 @@ TOPIC_EXISTS=$(docker compose exec -T kafka kafka-topics --bootstrap-server loca
 
 if [ -z "$TOPIC_EXISTS" ]; then
     fail "Topic cdc.public.policy does not exist"
-    info "Debezium may not have captured any changes yet."
-    info "Available topics:"
-    docker compose exec -T kafka kafka-topics --bootstrap-server localhost:9092 --list 2>/dev/null | sed 's/^/       /'
 else
     pass "Topic cdc.public.policy exists"
 
@@ -149,22 +140,6 @@ else
         pass "Topic has $MSG_COUNT message(s)"
     else
         warn "Topic exists but appears empty"
-        info "Debezium snapshot may not have completed yet. Wait 30s and retry."
-    fi
-
-    # Peek at one message to verify shape
-    SAMPLE=$(docker compose exec -T kafka kafka-console-consumer \
-        --bootstrap-server localhost:9092 \
-        --topic cdc.public.policy \
-        --from-beginning \
-        --max-messages 1 \
-        --timeout-ms 5000 2>/dev/null)
-
-    if echo "$SAMPLE" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'after' in d" 2>/dev/null; then
-        pass "Message has expected Debezium envelope (after field present)"
-    elif [ -n "$SAMPLE" ]; then
-        warn "Message received but unexpected shape"
-        info "First 200 chars: ${SAMPLE:0:200}"
     fi
 fi
 
@@ -176,14 +151,12 @@ FLINK_OVERVIEW=$(curl -s http://localhost:8081/overview 2>/dev/null)
 
 if [ -z "$FLINK_OVERVIEW" ]; then
     fail "Flink JobManager API not reachable at localhost:8081"
-    info "Run: docker compose logs flink-jobmanager"
 else
     TASKMANAGERS=$(echo "$FLINK_OVERVIEW" | python3 -c "import sys,json; print(json.load(sys.stdin).get('taskmanagers',0))" 2>/dev/null)
     if [ "$TASKMANAGERS" -ge 1 ] 2>/dev/null; then
         pass "Flink has $TASKMANAGERS TaskManager(s) registered"
     else
         fail "No TaskManagers registered"
-        info "Run: docker compose logs flink-taskmanager"
     fi
 
     JOBS_RUNNING=$(echo "$FLINK_OVERVIEW" | python3 -c "import sys,json; print(json.load(sys.stdin).get('jobs-running',0))" 2>/dev/null)
@@ -193,37 +166,61 @@ else
         pass "Flink has $JOBS_RUNNING running job(s)"
     else
         fail "No running Flink jobs (running=$JOBS_RUNNING, failed=$JOBS_FAILED)"
-        info "Check SQL submission: docker compose logs flink-jobmanager | grep -i 'error\|exception'"
-    fi
-
-    if [ "$JOBS_FAILED" -gt 0 ] 2>/dev/null; then
-        warn "$JOBS_FAILED failed Flink job(s) detected"
-        # Get failed job details
-        JOBS_LIST=$(curl -s http://localhost:8081/jobs/overview 2>/dev/null)
-        FAILED_IDS=$(echo "$JOBS_LIST" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-for j in data.get('jobs', []):
-    if j.get('state') == 'FAILED':
-        print(j['jid'])
-" 2>/dev/null)
-        for jid in $FAILED_IDS; do
-            EXCEPTIONS=$(curl -s "http://localhost:8081/jobs/$jid/exceptions" 2>/dev/null)
-            ROOT=$(echo "$EXCEPTIONS" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-exc = data.get('root-exception', '')
-print(exc[:300])
-" 2>/dev/null)
-            if [ -n "$ROOT" ]; then
-                info "Job $jid exception: $ROOT"
-            fi
-        done
     fi
 fi
 
 ###############################################################################
-header "STEP 5" "Output tables — flattened data"
+header "STEP 5" "Staging tables — Flink output"
+###############################################################################
+
+STG_TABLES=("stg_policy" "stg_coverage" "stg_vehicle" "stg_driver" "stg_claim")
+
+for tbl in "${STG_TABLES[@]}"; do
+    COUNT=$(docker compose exec -T postgres psql -U cdc_user -d cdc_db -tAc \
+        "SELECT count(*) FROM $tbl;" 2>/dev/null | tr -d '[:space:]')
+
+    if [ -z "$COUNT" ]; then
+        fail "$tbl — could not query"
+    elif [ "$COUNT" -gt 0 ]; then
+        pass "$tbl has $COUNT row(s)"
+    else
+        fail "$tbl is empty (Flink not writing to staging)"
+    fi
+done
+
+OP_CHECK=$(docker compose exec -T postgres psql -U cdc_user -d cdc_db -tAc \
+    "SELECT DISTINCT op FROM stg_policy ORDER BY op;" 2>/dev/null | tr -d '[:space:]')
+if [ -n "$OP_CHECK" ]; then
+    pass "stg_policy has op values: $OP_CHECK"
+else
+    warn "Could not verify op column in stg_policy"
+fi
+
+###############################################################################
+header "STEP 6" "dbt — event-trigger status"
+###############################################################################
+
+DBT_LOG=$(docker compose logs dbt 2>/dev/null | tail -80)
+if echo "$DBT_LOG" | grep -q "Completed successfully"; then
+    pass "dbt has completed at least one successful run"
+else
+    warn "dbt may not have completed a run yet (check: docker compose logs dbt)"
+fi
+
+if echo "$DBT_LOG" | grep -q "Listening on channel"; then
+    pass "Event trigger is listening on 'stg_data_arrived' channel"
+else
+    warn "Event trigger may not be active yet"
+fi
+
+if echo "$DBT_LOG" | grep -q "Notification(s) received"; then
+    pass "Event trigger has received at least one notification"
+else
+    warn "No notifications received yet (data may not have arrived)"
+fi
+
+###############################################################################
+header "STEP 7" "Output tables — dbt merged data"
 ###############################################################################
 
 OUTPUT_TABLES=("output_policy" "output_coverage" "output_vehicle" "output_driver" "output_claim")
@@ -237,12 +234,12 @@ for tbl in "${OUTPUT_TABLES[@]}"; do
     elif [ "$COUNT" -gt 0 ]; then
         pass "$tbl has $COUNT row(s)"
     else
-        fail "$tbl is empty"
+        fail "$tbl is empty (dbt may not have run yet)"
     fi
 done
 
 ###############################################################################
-header "STEP 6" "Live CDC test — insert and verify"
+header "STEP 8" "Live CDC test — insert and verify via event-triggered dbt"
 ###############################################################################
 
 LIVE_TAG="POL-VERIFY-$(date +%s)"
@@ -289,22 +286,43 @@ INSERT INTO policy (data) VALUES ('{
 }'::jsonb);
 " > /dev/null 2>&1
 
-info "Waiting for pipeline to process (polling up to 60s)..."
+# First check staging (should appear in ~15s)
+info "Waiting for record in staging tables (up to 30s)..."
+STG_FOUND=false
+for i in $(seq 1 6); do
+    sleep 5
+    STG_COUNT=$(docker compose exec -T postgres psql -U cdc_user -d cdc_db -tAc \
+        "SELECT count(*) FROM stg_policy WHERE policy_number = '$LIVE_TAG';" 2>/dev/null | tr -d '[:space:]')
+    if [ "$STG_COUNT" = "1" ]; then
+        STG_FOUND=true
+        STG_ARRIVED=$(python3 -c "import time; print(int(time.time()*1000))")
+        STG_ELAPSED=$(( STG_ARRIVED - INSERT_START ))
+        pass "Record appeared in stg_policy after ${STG_ELAPSED}ms (source -> staging)"
+        break
+    fi
+done
+if [ "$STG_FOUND" = false ]; then
+    fail "Record did not appear in stg_policy within 30s"
+fi
 
+# Wait for event-triggered dbt run to auto-merge (NOTIFY + debounce + dbt run)
+info "Waiting for event-triggered dbt to auto-merge (up to 30s)..."
 FOUND=false
-for i in $(seq 1 12); do
+for i in $(seq 1 6); do
     sleep 5
     LIVE_COUNT=$(docker compose exec -T postgres psql -U cdc_user -d cdc_db -tAc \
         "SELECT count(*) FROM output_policy WHERE policy_number = '$LIVE_TAG';" 2>/dev/null | tr -d '[:space:]')
-
     if [ "$LIVE_COUNT" = "1" ]; then
         FOUND=true
         OUTPUT_ARRIVED=$(python3 -c "import time; print(int(time.time()*1000))")
         E2E_ELAPSED=$(( OUTPUT_ARRIVED - INSERT_START ))
-        pass "Live CDC test passed — record appeared in output_policy"
-        info "End-to-end time (source -> output): ${E2E_ELAPSED}ms"
+        DBT_ELAPSED=$(( OUTPUT_ARRIVED - STG_ARRIVED ))
+        pass "Live CDC test passed — record auto-merged into output_policy (event-triggered)"
+        info "Timing breakdown:"
+        info "  Source -> Staging (Debezium+Kafka+Flink): ${STG_ELAPSED}ms"
+        info "  Staging -> Output (NOTIFY+debounce+dbt):  ${DBT_ELAPSED}ms"
+        info "  End-to-end total:                         ${E2E_ELAPSED}ms"
 
-        # Check downstream tables too
         COV=$(docker compose exec -T postgres psql -U cdc_user -d cdc_db -tAc \
             "SELECT count(*) FROM output_coverage oc JOIN output_policy op ON oc.policy_id = op.policy_id WHERE op.policy_number = '$LIVE_TAG';" 2>/dev/null | tr -d '[:space:]')
         VEH=$(docker compose exec -T postgres psql -U cdc_user -d cdc_db -tAc \
@@ -320,12 +338,105 @@ for i in $(seq 1 12); do
 done
 
 if [ "$FOUND" = false ]; then
-    fail "Live CDC test — record did not appear in output_policy within 60s"
-    info "Debug: check each step above to find where the pipeline stalled"
+    fail "Live CDC test — record did not auto-merge into output_policy within 30s"
+    info "Check event trigger logs: docker compose logs dbt --tail 30"
 fi
 
 ###############################################################################
-header "STEP 7" "PGAdmin"
+header "STEP 8b" "Live CDC update test — add vehicle + coverage to existing policy"
+###############################################################################
+
+if [ "$FOUND" = true ]; then
+    LIVE_POLICY_ID=$(docker compose exec -T postgres psql -U cdc_user -d cdc_db -tAc \
+        "SELECT id FROM policy WHERE data->>'policy_number' = '$LIVE_TAG';" 2>/dev/null | tr -d '[:space:]')
+
+    COV_BEFORE=$(docker compose exec -T postgres psql -U cdc_user -d cdc_db -tAc \
+        "SELECT count(*) FROM output_coverage WHERE policy_id = $LIVE_POLICY_ID;" 2>/dev/null | tr -d '[:space:]')
+    VEH_BEFORE=$(docker compose exec -T postgres psql -U cdc_user -d cdc_db -tAc \
+        "SELECT count(*) FROM output_vehicle WHERE policy_id = $LIVE_POLICY_ID;" 2>/dev/null | tr -d '[:space:]')
+
+    info "Policy $LIVE_TAG (id=$LIVE_POLICY_ID) has $COV_BEFORE coverage(s) and $VEH_BEFORE vehicle(s)"
+    info "Updating: adding collision coverage + second vehicle with driver..."
+
+    UPDATE_START=$(python3 -c "import time; print(int(time.time()*1000))")
+
+    docker compose exec -T postgres psql -U cdc_user -d cdc_db -c "
+    UPDATE policy SET data = data
+        || '{\"coverages\": [
+            {\"type\": \"liability\", \"limit\": 100000, \"deductible\": 500, \"premium\": 600.00},
+            {\"type\": \"collision\", \"limit\": 50000, \"deductible\": 1000, \"premium\": 475.00}
+        ]}'::jsonb
+        || '{\"vehicles\": [
+            {\"vin\": \"VERIFY12345678901\", \"year\": 2024, \"make\": \"Toyota\", \"model\": \"Camry\",
+             \"drivers\": [{\"name\": \"Verify Script\", \"license_number\": \"V000-0000-0001\", \"is_primary\": true}]},
+            {\"vin\": \"UPDATE98765432100\", \"year\": 2025, \"make\": \"Subaru\", \"model\": \"Outback\",
+             \"drivers\": [{\"name\": \"Verify Partner\", \"license_number\": \"V000-0000-0002\", \"is_primary\": true}]}
+        ]}'::jsonb,
+        updated_at = NOW()
+    WHERE id = $LIVE_POLICY_ID;
+    " > /dev/null 2>&1
+
+    # Wait for update to reach staging
+    info "Waiting for update in staging tables (up to 30s)..."
+    STG_UPDATE_FOUND=false
+    for i in $(seq 1 6); do
+        sleep 5
+        STG_UPDATE_COUNT=$(docker compose exec -T postgres psql -U cdc_user -d cdc_db -tAc \
+            "SELECT count(*) FROM stg_policy WHERE policy_id = $LIVE_POLICY_ID AND op = 'u';" 2>/dev/null | tr -d '[:space:]')
+        if [ "${STG_UPDATE_COUNT:-0}" -ge 1 ]; then
+            STG_UPDATE_FOUND=true
+            STG_UPDATE_ARRIVED=$(python3 -c "import time; print(int(time.time()*1000))")
+            STG_UPDATE_ELAPSED=$(( STG_UPDATE_ARRIVED - UPDATE_START ))
+            pass "Update arrived in staging after ${STG_UPDATE_ELAPSED}ms (op='u' event captured)"
+            break
+        fi
+    done
+    if [ "$STG_UPDATE_FOUND" = false ]; then
+        fail "Update did not appear in staging within 30s"
+    fi
+
+    # Wait for event-triggered dbt to auto-merge the update
+    info "Waiting for event-triggered dbt to auto-merge update (up to 30s)..."
+    UPDATE_MERGED=false
+    for i in $(seq 1 6); do
+        sleep 5
+        COV_AFTER=$(docker compose exec -T postgres psql -U cdc_user -d cdc_db -tAc \
+            "SELECT count(*) FROM output_coverage WHERE policy_id = $LIVE_POLICY_ID;" 2>/dev/null | tr -d '[:space:]')
+        VEH_AFTER=$(docker compose exec -T postgres psql -U cdc_user -d cdc_db -tAc \
+            "SELECT count(*) FROM output_vehicle WHERE policy_id = $LIVE_POLICY_ID;" 2>/dev/null | tr -d '[:space:]')
+        if [ "${COV_AFTER:-0}" -ge 2 ] && [ "${VEH_AFTER:-0}" -ge 2 ]; then
+            UPDATE_MERGED=true
+            UPDATE_DONE=$(python3 -c "import time; print(int(time.time()*1000))")
+            UPDATE_E2E=$(( UPDATE_DONE - UPDATE_START ))
+            break
+        fi
+    done
+
+    if [ "$UPDATE_MERGED" = true ]; then
+        DRV_AFTER=$(docker compose exec -T postgres psql -U cdc_user -d cdc_db -tAc \
+            "SELECT count(*) FROM output_driver WHERE policy_id = $LIVE_POLICY_ID;" 2>/dev/null | tr -d '[:space:]')
+
+        pass "output_coverage: $COV_BEFORE -> $COV_AFTER (collision coverage added)"
+        pass "output_vehicle: $VEH_BEFORE -> $VEH_AFTER (Subaru Outback added)"
+        [ "${DRV_AFTER:-0}" -ge 2 ] && pass "output_driver: 1 -> $DRV_AFTER (Verify Partner added)" || fail "output_driver: expected >= 2, got $DRV_AFTER"
+
+        if [ "$STG_UPDATE_FOUND" = true ]; then
+            DBT_UPDATE_ELAPSED=$(( UPDATE_DONE - STG_UPDATE_ARRIVED ))
+            info "Update timing breakdown:"
+            info "  Source -> Staging (Debezium+Kafka+Flink): ${STG_UPDATE_ELAPSED}ms"
+            info "  Staging -> Output (NOTIFY+debounce+dbt):  ${DBT_UPDATE_ELAPSED}ms"
+            info "  End-to-end total:                         ${UPDATE_E2E}ms"
+        fi
+    else
+        fail "Update did not auto-merge into output tables within 30s"
+        info "Check event trigger logs: docker compose logs dbt --tail 30"
+    fi
+else
+    info "Skipping update test — insert test did not pass"
+fi
+
+###############################################################################
+header "STEP 9" "PGAdmin"
 ###############################################################################
 
 PGADMIN_HTTP=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5050/login 2>/dev/null)

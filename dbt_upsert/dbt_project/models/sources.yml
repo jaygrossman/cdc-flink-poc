@@ -1,0 +1,11 @@
+version: 2
+
+sources:
+  - name: cdc
+    schema: public
+    tables:
+      - name: stg_policy
+      - name: stg_coverage
+      - name: stg_vehicle
+      - name: stg_driver
+      - name: stg_claim

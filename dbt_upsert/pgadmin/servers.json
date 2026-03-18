@@ -1,0 +1,15 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "CDC Postgres",
+      "Group": "Servers",
+      "Host": "postgres",
+      "Port": 5432,
+      "MaintenanceDB": "cdc_db",
+      "Username": "cdc_user",
+      "SSLMode": "prefer",
+      "PassFile": "/tmp/pgpass",
+      "Password": "cdc_pass"
+    }
+  }
+}

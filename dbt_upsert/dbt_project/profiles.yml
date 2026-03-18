@@ -1,0 +1,12 @@
+cdc_dbt_upsert:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: postgres
+      port: 5432
+      user: cdc_user
+      password: cdc_pass
+      dbname: cdc_db
+      schema: public
+      threads: 1
