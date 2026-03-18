@@ -1,0 +1,4 @@
+.DS_Store
+*.log
+**/dbt_project/target/
+**/dbt_project/.user.yml
