@@ -1,0 +1,20 @@
+FROM flink:1.18.1
+
+# Install curl for health-check scripts
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
+# Download Kafka connector and its required Kafka client dependency
+RUN wget -q -P /opt/flink/lib/ \
+    https://repo1.maven.org/maven2/org/apache/flink/flink-connector-kafka/3.1.0-1.18/flink-connector-kafka-3.1.0-1.18.jar && \
+    wget -q -P /opt/flink/lib/ \
+    https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/3.4.0/kafka-clients-3.4.0.jar
+
+# Download JDBC connector
+RUN wget -q -P /opt/flink/lib/ \
+    https://repo1.maven.org/maven2/org/apache/flink/flink-connector-jdbc/3.1.2-1.18/flink-connector-jdbc-3.1.2-1.18.jar
+
+# Download PostgreSQL JDBC driver
+RUN wget -q -P /opt/flink/lib/ \
+    https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.1/postgresql-42.7.1.jar
+
+# flink-json-1.18.1.jar is already included in the base image

@@ -17,7 +17,7 @@ A single `policy` table with nested JSONB (policyholder, coverages, vehicles, dr
 
 ## Variants
 
-This repo contains three implementations of the pipeline, each in its own directory:
+This repo contains four implementations of the pipeline, each in its own directory:
 
 ### [`append_new_records/`](append_new_records/)
 
@@ -56,18 +56,32 @@ Same staging + dbt architecture as `dbt_upsert`, but replaces the polling loop w
 - Uses PostgreSQL triggers + Python psycopg2 LISTEN/NOTIFY
 - Best for: when you want dbt's merge control without the latency penalty of polling
 
+### [`pg_transaction/`](pg_transaction/)
+
+**Flink to staging + PG transaction merge** -- the no-dbt approach.
+
+Same staging architecture as the dbt variants, but replaces dbt entirely with a single PL/pgSQL function (`merge_cdc_batch()`) that merges all 5 output tables inside one Postgres transaction. Uses LISTEN/NOTIFY for event-driven triggering. Splits into separate source and CDC databases.
+
+- Handles inserts, updates, and deletes
+- All 5 output tables update atomically (single transaction)
+- No dbt dependency -- pure SQL merge logic
+- Separate source and CDC databases (production-like topology)
+- Watermark-based staging tracking (no re-scanning)
+- Best for: when you want atomic cross-table consistency, don't need dbt, and prefer a simpler operational footprint
+
 ## Comparison
 
-| | append_new_records | dbt_upsert | dbt_event_trigger |
-|---|---|---|---|
-| Flink writes to | `output_*` (upsert) | `stg_*` (append-only) | `stg_*` (append-only) |
-| Merge strategy | Flink JDBC upsert | dbt incremental | dbt incremental |
-| Delete handling | Ignored | Captured and applied | Captured and applied |
-| Change history | Overwritten | Preserved in staging | Preserved in staging |
-| dbt trigger | N/A | 30s polling loop | PG NOTIFY (event-driven) |
-| End-to-end latency | ~5-15s | ~30-60s (loop) | ~6-10s (event-driven) |
-| Idle overhead | None | dbt runs even with no data | Zero runs when idle |
-| Additional services | None | dbt container | dbt container + PG triggers |
+| | append_new_records | dbt_upsert | dbt_event_trigger | pg_transaction |
+|---|---|---|---|---|
+| Flink writes to | `output_*` (upsert) | `stg_*` (append-only) | `stg_*` (append-only) | `stg_*` (append-only) |
+| Merge strategy | Flink JDBC upsert | dbt incremental | dbt incremental | PL/pgSQL DELETE+INSERT |
+| Delete handling | Ignored | Captured and applied | Captured and applied | In-transaction DELETE |
+| Atomicity | Per-table | Per-table | Per-table | All 5 tables in 1 txn |
+| Databases | 1 (shared) | 1 (shared) | 1 (shared) | 2 (source + cdc) |
+| dbt required | No | Yes | Yes | No |
+| Trigger | N/A | 30s polling loop | PG NOTIFY | PG NOTIFY |
+| End-to-end latency | ~5-15s | ~30-60s (loop) | ~6-10s (event-driven) | ~5-10s (event-driven) |
+| Idle overhead | None | dbt runs even with no data | Zero when idle | Zero when idle |
 
 ## Prerequisites
 
@@ -97,6 +111,13 @@ cd dbt_event_trigger
 docker compose up --build
 ```
 
+or
+
+```bash
+cd pg_transaction
+docker compose up --build
+```
+
 Each variant includes a verification script that checks every component and runs a live end-to-end test with timing:
 
 ```bash
@@ -113,7 +134,7 @@ docker compose down -v
 
 ## Services
 
-All three variants share the same core infrastructure:
+All four variants share the same core infrastructure:
 
 | Service | Port | Description |
 |---------|------|-------------|
@@ -125,4 +146,4 @@ All three variants share the same core infrastructure:
 | Flink TaskManager | -- | Stream processing (worker) |
 | PGAdmin | 5050 | Database UI (admin@admin.com / admin) |
 
-The `dbt_upsert` and `dbt_event_trigger` variants add a **dbt** container that runs incremental merges (polling loop and event-driven respectively).
+The `dbt_upsert` and `dbt_event_trigger` variants add a **dbt** container. The `pg_transaction` variant adds a **merge-listener** container and uses two separate PostgreSQL instances (source on port 5433, CDC on port 5432).
